@@ -1,0 +1,6 @@
+import psycopg2
+
+secret="{{ postfix_disposable_secret }}"
+
+def create_psycopg2_connection():
+    return psycopg2.connect(host="127.0.0.1", dbname="{{ mail_db_database }}", user="{{ mail_db_username }}", password="{{ mail_db_password }}")

@@ -1,0 +1,54 @@
+- name: Install necessary packages
+  apt: pkg={{ item }} state=present
+  with_items:
+    - python3-psycopg2
+  tags:
+    - dependencies
+
+
+- name: Copy postfix_disposable.py
+  copy: src=etc_postfix_postfix_disposable.py dest=/etc/postfix/postfix_disposable.py owner=root group=root mode=a+x
+
+- name: Copy disposable_config.py
+  template: src=etc_postfix_disposable_config.py.j2 dest=/etc/postfix/disposable_config.py owner=root group=root 
+
+
+- name: Copy additional postfix configuration files
+  template: src=etc_postfix_{{ item }}.j2 dest=/etc/postfix/{{ item }} owner=root group=root
+  with_items:
+    - pgsql-disposable-alias-maps.cf
+
+- name: Configure virtual mailbox 
+  lineinfile: 
+    path: /etc/postfix/main.cf
+    regexp: '^virtual_alias_maps *='
+    line: 'virtual_alias_maps = pgsql:/etc/postfix/pgsql-virtual-alias-maps.cf pgsql:/etc/postfix/pgsql-disposable-alias-maps.cf'
+
+- name: Configure content filter
+  blockinfile:
+    path: /etc/postfix/main.cf
+    block: |
+      # Disposable mailbox
+      content_filter = disposable_pipe:localhost:10025
+      receive_override_options = no_address_mappings
+
+
+- name: Configure master.cf
+  blockinfile:
+    path: /etc/postfix/master.cf
+    block: |
+      # disposable mailaddresses
+      disposable_server      unix  -       -       n       -       10      smtp
+            -o smtp_send_xforward_command=yes
+            -o disable_mime_output_conversion=yes
+
+      disposable_pipe        unix  -       n       n       -       10      pipe
+            flags=Rq user=vmail:vmail null_sender=
+            argv=/etc/postfix/postfix_disposable.py --from ${sender} -- ${recipient}
+      
+      localhost:10026 inet  n       -       n       -       10      smtpd
+            -o content_filter=
+            -o receive_override_options=no_unknown_recipient_checks,no_header_body_checks,no_milters
+            -o smtpd_authorized_xforward_hosts=127.0.0.0/8
+  notify: restart postfix
+

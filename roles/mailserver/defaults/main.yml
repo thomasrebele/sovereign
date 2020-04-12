@@ -22,3 +22,7 @@ mail_virtual_aliases: []
 zpush_version: 2.1.1-1788
 # common_timezone is a sovereign variable
 zpush_timezone: "{{ common_timezone|default('Etc/UTC') }}"
+
+# postfix_disposable
+postfix_disposable_secret: "{{ lookup('password', secret + '/' + 'postfix_disposable_secret', length=32) }}"
+
