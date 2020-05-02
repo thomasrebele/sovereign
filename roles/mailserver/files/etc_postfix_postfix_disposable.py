@@ -16,6 +16,13 @@ from email import utils
 
 prefix="dm-"
 
+re_header_end = re.compile(b'\n\n')
+re_dkim_sig = re.compile(b'\nDKIM-Signature:')
+re_header_field_end = re.compile(b'\n[^ \t]')
+re_from_line = re.compile(b'\n[Ff]rom: [^\n]*\n')
+re_subject_pattern = re.compile(b'\nSubject: ([^\n]*)\n')
+
+
 #--------------------------------------------------------------------------------
 # read configuration
 #--------------------------------------------------------------------------------
@@ -124,7 +131,7 @@ def check_new_alias(addr_from, addr_to):
 	# if recipient starts with prefix
 	# add mailfrom to disposable_aliases
 	if not addr_to.startswith(prefix):
-		return
+		return "wrong prefix for " + addr_from
 
 	# extract token and hash for verification
 	at_pos = addr_to.rindex("@")
@@ -134,10 +141,10 @@ def check_new_alias(addr_from, addr_to):
 	sig = addr_to[dot_pos+1 : at_pos]
 	token_hash, _ = hash_token(token)
 
-	outsider_hash = sig[len(version):len(token_hash)+1]
+	outsider_hash = sig[len(version):][:len(token_hash)]
 
 	if token_hash != outsider_hash:
-		return
+		return "wrong hash for " + addr_to + " was " + outsider_hash + " (from signature " + sig + ")" + ", should have been " + token_hash
 
 	# fetch local address
 	with conn.cursor() as cur:
@@ -148,7 +155,7 @@ def check_new_alias(addr_from, addr_to):
 
 		row = cur.fetchone()
 		if row is None:
-			return
+			return "alias " + addr_to + " does not exist"
 	local = row[0]
 
 	# register
@@ -173,13 +180,29 @@ def replace_with_disposable(addr_from, addr_to):
 		return row[0], True
 
 
+def remove_dkim_signature(data):
+	"""Removes the field "DKIM-Signature" from the mail header"""
+	sep = re_header_end.search(data)
+	if not sep:
+		sep_pos = len(data)
+	else:
+		sep_pos = sep.start()
+	dkim = re_dkim_sig.search(data)
+	if not dkim or dkim.start() > sep_pos:
+		return data
 
-header_body_sep = re.compile(b'\n\n')
-from_line = re.compile(b'\n[Ff]rom: [^\n]*\n')
+	dkim_end = re_header_field_end.search(data, dkim.end())
+	if not dkim_end:
+		return data
+
+	return data[:dkim.start()] + data[dkim_end.start():]
+
+
+
 def rewrite_from_address(data, mailfrom):
 	"""Changes the sender of the message"""
 
-	sep = header_body_sep.search(data)
+	sep = re_header_end.search(data)
 	if not sep:
 		sep_pos = len(data)
 	else:
@@ -188,7 +211,7 @@ def rewrite_from_address(data, mailfrom):
 	next_start = 0
 	count = 0
 	while True:
-		from_pos = from_line.search(data, next_start)
+		from_pos = re_from_line.search(data, next_start)
 		print("found " + str(from_pos))
 		if not from_pos:
 			break
@@ -198,7 +221,8 @@ def rewrite_from_address(data, mailfrom):
 		count =+ 1
 
 	new_from = b'\nFrom: ' + mailfrom.encode() + b'\n'
-	return from_line.sub(new_from, data, count)
+	data = re_from_line.sub(new_from, data, count)
+	return data
 
 
 def send_command_reply(addr_from, subject, data):
@@ -227,42 +251,68 @@ Date: {date}
 	server.quit()
 
 
-subject_pattern = re.compile(b'\nSubject: ([^\n]*)\n')
-def handle_command(addr_from, data):
+def list_rindex(lst, item):
+	for i in range(len(lst)-1, -1, -1):
+		if lst[i] == item:
+			return i
+	return -1
 
-	subj_match = subject_pattern.search(data)
-	subj = subj_match.group(1)
-	subj = subj.decode()
 
-	sep = header_body_sep.search(data)
-	if sep:
-		sep_pos = sep.start()
-	else:
-		sep_pos = 0
-	body = data[sep_pos:].decode().strip()
-
-	words = subj.split(" ")
-	if words[0] == "create":
+def handle_command(local_addr, args, body):
+	if args[0] == "create":
 		reply = "generated aliases:\n"
-		for token in words[1:]:
-			disp = create_disposable_alias(token, addr_from, body)
-			reply += "\n" + token + ": " + disp
+		for token in args[1:]:
+			disp = create_disposable_alias(token, local_addr, body)
+			reply += "\n\t" + token + ": " + disp
+		reply += "\n"
+		return "created addresses", reply
 
-		send_command_reply(addr_from, "created addresses", reply)
 
-	elif words[0] == "delete":
-		for disposable_addr in words[1:]:
-			delete_disposable_alias(disposable_addr, addr_from)
-		reply = "\n".join(words[1:])
-		send_command_reply(addr_from, "deleted addresses", reply)
+	if args[0] == "register":
+		split_idx = list_rindex(args, "for")
+		if split_idx < 1:
+			return "usage: register <token>... for <external_mail_addr>...", ""
 
-	else:
-		send_command_reply(addr_from, "unknown command " + words[0], "")
+		reply = "generated aliases:\n"
+		disp_addrs = []
+		for token in args[1:split_idx]:
+			disp = create_disposable_alias(token, local_addr, body)
+			disp_addrs.append(disp)
+			reply += "\n\t" + token + ": " + disp
+		reply += "\n\nregistered rewrites:\n"
+		for external_mail_addr in args[split_idx+1:]:
+			for disp in disp_addrs:
+				info = check_new_alias(external_mail_addr, disp)
+				reply += "\n\t" + info
+		reply += "\n"
+
+		return "registered addresses", reply
+
+
+	if args[0] == "delete":
+		for disposable_addr in args[1:]:
+			delete_disposable_alias(disposable_addr, local_addr)
+		reply = "\n".join(args[1:])
+		return "deleted addresses", reply
+
+	return "unknown command " + args[0], ""
 
 
 def handle_mail(addr_from, addr_tos, data):
 	if service_addr in addr_tos:
-		handle_command(addr_from, data)
+		subj_match = re_subject_pattern.search(data)
+		subj = subj_match.group(1)
+		subj = subj.decode()
+
+		sep = re_header_end.search(data)
+		if sep:
+			sep_pos = sep.start()
+		else:
+			sep_pos = 0
+		body = data[sep_pos:].decode().strip()
+		args = subj.split(" ")
+		result = handle_command(addr_from, args, body)
+		send_command_reply(local_addr, result[0], result[1])
 		return
 
 	# apply transformation for sender
@@ -282,9 +332,14 @@ def handle_mail(addr_from, addr_tos, data):
 	if from_changed:
 		data = rewrite_from_address(data, addr_from)
 
+	# remove DKIM signature
+	# - if from address has been rewritten, the signature is invalid
+	# - if nothing has changed, it would be added again by the milter
+	data = remove_dkim_signature(data)
 	server = smtplib.SMTP('localhost', 10026)
 	server.sendmail(addr_from, addr_tos, data)
 	server.quit()
+
 
 #--------------------------------------------------------------------------------
 # internal smtp server
@@ -357,11 +412,12 @@ if __name__ == '__main__':
 		handle_mail(addr_from, rcptos, data)
 		conn.close()
 
-	if args[0] == "--create":
-		token = args[1]
-		local_dest = args[2]
-		disp = create_disposable_alias(token, local_dest)
-		print(disp)
+	if args[0] == "--manage":
+		local_addr = args[1]
+		# TODO: description for create
+		result = handle_command(local_addr, args[2:], "")
+		print(result[0])
+		print(result[1])
 		conn.close()
 
 # vim: tabstop=4 softtabstop=0 noexpandtab shiftwidth=4 smarttab
